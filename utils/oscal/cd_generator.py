@@ -1,17 +1,15 @@
-#! /usr/bin/python3
+#!/usr/bin/env python3
 
-"""Build a component definition for a product from pre-existing profiles"""
+"""Build a component definition for a product from pre-existing OSCAL profiles"""
 
-import json
 import logging
-import os
 import pathlib
 import re
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from trestle.common.common_types import TypeWithProps, TypeWithParts
 from trestle.common.const import TRESTLE_HREF_HEADING, IMPLEMENTATION_STATUS
-from trestle.common.list_utils import as_list
+from trestle.common.list_utils import as_list, none_if_empty
 from trestle.core.generators import generate_sample_model
 from trestle.core.catalog.catalog_interface import CatalogInterface
 from trestle.core.control_interface import ControlInterface
@@ -26,16 +24,19 @@ from trestle.oscal.component import (
     Statement,
 )
 
-import ssg.components
-import ssg.environment
-import ssg.rules
-import ssg.build_yaml
-from ssg.controls import ControlsManager, Status, Control
+
+from ssg.controls import Status, Control
+from ssg.utils import required_key
+
+from utils.oscal import add_prop
+from utils.oscal.control_selector import ControlSelector
+from utils.oscal.params_extractor import ParameterExtractor
+from utils.oscal.rules_transformer import RulesTransformer, RuleInfo
 
 
 logger = logging.getLogger(__name__)
 
-SECTION_PATTERN = r'Section ([a-z]):'
+SECTION_PATTERN = r"Section ([a-z]):"
 
 
 class OscalStatus:
@@ -79,7 +80,7 @@ class OSCALProfileHelper:
             self._root,
             profile_path,
             block_params=False,
-            params_format='[.]',
+            params_format="[.]",
             show_value_warnings=True,
         )
 
@@ -123,28 +124,29 @@ class ComponentDefinitionGenerator:
 
     def __init__(
         self,
-        product: str,
         root: str,
         json_path: str,
-        build_config_yaml: str,
+        env_yaml: Dict[str, Any],
         vendor_dir: str,
         profile_name_or_href,
-        control: str,
+        control_selector: ControlSelector,
     ) -> None:
         """
         Initialize the component definition generator and load the necessary files.
 
         Args:
-            product: Product to generate the component definition for
             root: Root of the SSG project
             json_path: Path to the rules_dir.json file
-            build_config_yaml: Path to the build_config.yml file
+            env_yaml: Yaml file with environment information
             vendor_dir: Path to the vendor directory
             profile_name_or_href: Name or href of the profile to use
+            control_selector: Control selector that contains control responses
         """
         self.ssg_root = root
         self.trestle_root = pathlib.Path(vendor_dir)
-        self.product = product
+        self.product = required_key(env_yaml, "product")
+        self.env_yaml = env_yaml
+        self.control_selector = control_selector
 
         profile_path, profile_href = self.get_source(profile_name_or_href)
         self.profile_href = profile_href
@@ -152,48 +154,22 @@ class ComponentDefinitionGenerator:
         self.profile = OSCALProfileHelper(self.trestle_root)
         self.profile.load(profile_path)
 
-        self.env_yaml = self.get_env_yaml(build_config_yaml)
-        self.policy_id = control
-        self.controls_mgr = self.get_controls_mgr(control)
-
-        with open(json_path, 'r') as f:
-            rule_dir_json = json.load(f)
-        self.rule_json = rule_dir_json
-
-    def get_env_yaml(self, build_config_yaml: str) -> Dict[str, Any]:
-        """Get the environment yaml."""
-        product_dir = os.path.join(self.ssg_root, "products", self.product)
-        product_yaml_path = os.path.join(product_dir, "product.yml")
-        env_yaml = ssg.environment.open_environment(
-            build_config_yaml,
-            product_yaml_path,
-            os.path.join(self.ssg_root, "product_properties"),
+        self.rules_transformer = RulesTransformer(
+            root, self.env_yaml, json_path, ParameterExtractor(root, self.env_yaml)
         )
-        return env_yaml
 
     def get_source(self, profile_name_or_href: str) -> Tuple[str, str]:
         """Get the source of the profile."""
-        profile_in_trestle_dir = '://' not in profile_name_or_href
+        profile_in_trestle_dir = "://" not in profile_name_or_href
         profile_href = profile_name_or_href
         if profile_in_trestle_dir:
-            local_path = f'profiles/{profile_name_or_href}/profile.json'
+            local_path = f"profiles/{profile_name_or_href}/profile.json"
             profile_href = TRESTLE_HREF_HEADING + local_path
             profile_path = str(self.trestle_root / local_path)
         else:
             profile_path = profile_href
 
         return profile_path, profile_href
-
-    def get_controls_mgr(self, control):
-        """Get the control response and implementation status from the policy."""
-        controls_dir = os.path.join(self.ssg_root, "controls")
-        controls_manager = ControlsManager(
-            controls_dir=controls_dir, env_yaml=self.env_yaml
-        )
-        controls_manager.load()
-        if control not in controls_manager.policies:
-            raise ValueError(f"Policy {control} not found in controls")
-        return controls_manager
 
     def create_implemented_requirement(
         self, control: Control
@@ -206,7 +182,7 @@ class ComponentDefinitionGenerator:
             implemented_req = generate_sample_model(ImplementedRequirement)
             implemented_req.control_id = control_id
             self.handle_response(implemented_req, control)
-            # TODO(jpower432): Setup rules in the properties file
+            self.add_rules(implemented_req, control.rules)
             return implemented_req
         return None
 
@@ -220,7 +196,7 @@ class ComponentDefinitionGenerator:
         """
         control_response = control.notes
         pattern = re.compile(SECTION_PATTERN, re.IGNORECASE)
-        lines = control_response.split('\n')
+        lines = control_response.split("\n")
 
         sections_dict = dict()
         current_section_label = None
@@ -250,13 +226,21 @@ class ComponentDefinitionGenerator:
                 if statement_id is None:
                     continue
 
-                section_content_str = '\n'.join(section_content)
-                section_content_str = pattern.sub('', section_content_str)
+                section_content_str = "\n".join(section_content)
+                section_content_str = pattern.sub("", section_content_str)
                 statement = self.create_statement(statement_id)
                 self._add_response_by_status(
                     statement, oscal_status, section_content_str.strip()
                 )
                 implemented_req.statements.append(statement)
+
+    def add_rules(self, type_with_props: TypeWithProps, rule_ids: List[str]) -> None:
+        """Add rules to a type with props."""
+        all_props: List[Property] = as_list(type_with_props.props)
+        rules_objs: List[RuleInfo] = self.rules_transformer.load(rule_ids)
+        rule_properties: List[Property] = self.rules_transformer.transform(rules_objs)
+        all_props.extend(rule_properties)
+        type_with_props.props = none_if_empty(all_props)
 
     @staticmethod
     def _add_response_by_status(
@@ -271,9 +255,8 @@ class ComponentDefinitionGenerator:
         remarks with justification for the status.
         """
 
-        status_prop = Property(
-            name=IMPLEMENTATION_STATUS, value=implementation_status
-        )  # type: ignore
+        status_prop = add_prop(IMPLEMENTATION_STATUS, implementation_status, "")
+
         if (
             implementation_status == OscalStatus.IMPLEMENTED
             or implementation_status == OscalStatus.PARTIAL
@@ -298,7 +281,8 @@ class ComponentDefinitionGenerator:
         ci = generate_sample_model(ControlImplementation)
         ci.source = self.profile_href
         all_implement_reqs = list()
-        for control in self.controls_mgr.get_all_controls(self.policy_id):
+
+        for control in self.control_selector.get_controls():
             implemented_req = self.create_implemented_requirement(control)
             if implemented_req:
                 all_implement_reqs.append(implemented_req)
